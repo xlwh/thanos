@@ -31,14 +31,19 @@ const (
 
 type setupFunc func(*run.Group, log.Logger, *prometheus.Registry, opentracing.Tracer, bool) error
 
+// 主函数入口
 func main() {
+	// 这个估计是抄的Prometheus的代码
+	// Debug 模式下，会开启一些profile信息，从环境变量中获取DEBUG标记
 	if os.Getenv("DEBUG") != "" {
 		runtime.SetMutexProfileFraction(10)
 		runtime.SetBlockProfileRate(10)
 	}
 
+	// 这个也是抄的Prometheus
 	app := kingpin.New(filepath.Base(os.Args[0]), "A block storage based long-term storage for Prometheus")
 
+	// 设置一些Flag
 	app.Version(version.Print("thanos"))
 	app.HelpFlag.Short('h')
 
@@ -51,17 +56,19 @@ func main() {
 
 	tracingConfig := regCommonTracingFlags(app)
 
+	// 注册各个组件
 	cmds := map[string]setupFunc{}
-	registerSidecar(cmds, app)
-	registerStore(cmds, app)
-	registerQuery(cmds, app)
-	registerRule(cmds, app)
-	registerCompact(cmds, app)
-	registerBucket(cmds, app, "bucket")
-	registerDownsample(cmds, app)
-	registerReceive(cmds, app)
-	registerChecks(cmds, app, "check")
+	registerSidecar(cmds, app)          // Slidecar   done
+	registerStore(cmds, app)            // Store
+	registerQuery(cmds, app)            // Query      done
+	registerRule(cmds, app)             // Rule
+	registerCompact(cmds, app)          // Compact
+	registerBucket(cmds, app, "bucket") // Bucket
+	registerDownsample(cmds, app)       // Downsample
+	registerReceive(cmds, app)          // Receiver	   done
+	registerChecks(cmds, app, "check")  // Check
 
+	// 解析命令行参数
 	cmd, err := app.Parse(os.Args[1:])
 	if err != nil {
 		fmt.Fprintln(os.Stderr, errors.Wrapf(err, "Error parsing commandline arguments"))
@@ -69,6 +76,7 @@ func main() {
 		os.Exit(2)
 	}
 
+	// 初始化日志组件
 	var logger log.Logger
 	{
 		var lvl level.Option
@@ -109,6 +117,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, errors.Wrapf(err, "failed to set GOMAXPROCS: %v", err))
 	}
 
+	// 注册自身的监控采集器
 	metrics := prometheus.NewRegistry()
 	metrics.MustRegister(
 		version.NewCollector("thanos"),
@@ -130,6 +139,7 @@ func main() {
 		os.Exit(1)
 	}
 
+	// 启动运行组？？Group
 	var g run.Group
 	var tracer opentracing.Tracer
 
@@ -175,12 +185,13 @@ func main() {
 		})
 	}
 
+	// 执行命令，根据命令进行服务的启动
 	if err := cmds[cmd](&g, logger, metrics, tracer, *logLevel == "debug"); err != nil {
 		level.Error(logger).Log("err", errors.Wrapf(err, "%s command failed", cmd))
 		os.Exit(1)
 	}
 
-	// Listen for termination signals.
+	// 监听一些信号，收到服务退出信号，就进行服务的退出操作
 	{
 		cancel := make(chan struct{})
 		g.Add(func() error {
@@ -197,6 +208,7 @@ func main() {
 	level.Info(logger).Log("msg", "exiting")
 }
 
+// 收到信号，服务退出
 func interrupt(logger log.Logger, cancel <-chan struct{}) error {
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, syscall.SIGINT, syscall.SIGTERM)

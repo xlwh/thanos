@@ -47,24 +47,29 @@ type Prober struct {
 }
 
 // NewProber returns Prober representing readiness and healthiness of given component.
+// 给对应的组件加上一些探针服务，方便K8s定期的对组件进行一些健康检查
 func NewProber(component component.Component, logger log.Logger, reg prometheus.Registerer) *Prober {
 	initialErr := fmt.Errorf(initialErrorFmt, component)
 	p := &Prober{
-		component:   component,
-		logger:      logger,
+		component:   component, // 对应的组件
+		logger:      logger,    // 日志
 		healthiness: initialErr,
 		readiness:   initialErr,
+
+		// 组件就绪监控
 		readyStateMetric: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name:        "prober_ready",
 			Help:        "Represents readiness status of the component Prober.",
 			ConstLabels: map[string]string{"component": component.String()},
 		}),
+		// 组件健康的监控
 		healthyStateMetric: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name:        "prober_healthy",
 			Help:        "Represents health status of the component Prober.",
 			ConstLabels: map[string]string{"component": component.String()},
 		}),
 	}
+	// 注册监控指标
 	if reg != nil {
 		reg.MustRegister(p.readyStateMetric, p.healthyStateMetric)
 	}

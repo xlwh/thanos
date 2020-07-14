@@ -26,6 +26,7 @@ import (
 	"github.com/thanos-io/thanos/pkg/runutil"
 )
 
+// 监控指标
 type metrics struct {
 	dirSyncs          prometheus.Counter
 	dirSyncFailures   prometheus.Counter
@@ -75,13 +76,13 @@ func newMetrics(r prometheus.Registerer, uploadCompacted bool) *metrics {
 // Shipper watches a directory for matching files and directories and uploads
 // them to a remote data store.
 type Shipper struct {
-	logger          log.Logger
-	dir             string
-	metrics         *metrics
-	bucket          objstore.Bucket
-	labels          func() labels.Labels
-	source          metadata.SourceType
-	uploadCompacted bool
+	logger          log.Logger           // 日志
+	dir             string               // 数据所在目录
+	metrics         *metrics             // 监控指标
+	bucket          objstore.Bucket      // 对象存储Client
+	labels          func() labels.Labels // 用户在Prometheus上定义的数据tag，比如说region、replica等
+	source          metadata.SourceType  // 标记一下数据来源，来源于哪个组件
+	uploadCompacted bool                 // 是否完全上传数据
 }
 
 // New creates a new shipper that detects new TSDB blocks in dir and uploads them
@@ -250,7 +251,19 @@ func (c *lazyOverlapChecker) IsOverlapping(ctx context.Context, newMeta tsdb.Blo
 // If uploaded.
 //
 // It is not concurrency-safe, however it is compactor-safe (running concurrently with compactor is ok).
+// 并不是线程安全的，但是压缩处理安全
 func (s *Shipper) Sync(ctx context.Context) (uploaded int, err error) {
+	// 读Meta文件,如果读取失败，那么会创建一个空的meta
+	// 会在Prometheus的数据目录下创建一个文件，保存一下数据上传进度等信息
+	/*
+		{
+			"version": 1,
+			"uploaded": [
+				"01ED5DBW7BH93V87MXVQKF6167",
+				"01ED5WT15XQMV388DYAWH8BHXT"
+			]
+		}
+	*/
 	meta, err := ReadMetaFile(s.dir)
 	if err != nil {
 		// If we encounter any error, proceed with an empty meta file and overwrite it later.
@@ -263,6 +276,7 @@ func (s *Shipper) Sync(ctx context.Context) (uploaded int, err error) {
 	}
 
 	// Build a map of blocks we already uploaded.
+	// An ULID is a 16 byte Universally Unique Lexicographically Sortable Identifier
 	hasUploaded := make(map[ulid.ULID]struct{}, len(meta.Uploaded))
 	for _, id := range meta.Uploaded {
 		hasUploaded[id] = struct{}{}
@@ -276,6 +290,7 @@ func (s *Shipper) Sync(ctx context.Context) (uploaded int, err error) {
 		uploadErrs int
 	)
 	// Sync non compacted blocks first.
+	// 会检查哪些数据没有上传，进行数据的上传操作
 	if err := s.iterBlockMetas(func(m *metadata.Meta) error {
 		// Do not sync a block if we already uploaded or ignored it. If it's no longer found in the bucket,
 		// it was generally removed by the compaction process.
@@ -284,6 +299,7 @@ func (s *Shipper) Sync(ctx context.Context) (uploaded int, err error) {
 			return nil
 		}
 
+		// 从meta中读取，发现是空的，那么就忽略
 		if m.Stats.NumSamples == 0 {
 			// Ignore empty blocks.
 			level.Debug(s.logger).Log("msg", "ignoring empty block", "block", m.ULID)
@@ -291,6 +307,7 @@ func (s *Shipper) Sync(ctx context.Context) (uploaded int, err error) {
 		}
 
 		// Check against bucket if the meta file for this block exists.
+		// 会先判断一下文件在对应的存储上是否存在
 		ok, err := s.bucket.Exists(ctx, path.Join(m.ULID.String(), block.MetaFilename))
 		if err != nil {
 			return errors.Wrap(err, "check exists")
@@ -300,6 +317,7 @@ func (s *Shipper) Sync(ctx context.Context) (uploaded int, err error) {
 		}
 
 		// We only ship of the first compacted block level as normal flow.
+		// 只处理没有进行Compaction的数据
 		if m.Compaction.Level > 1 {
 			if !s.uploadCompacted {
 				return nil
@@ -312,6 +330,7 @@ func (s *Shipper) Sync(ctx context.Context) (uploaded int, err error) {
 			}
 		}
 
+		// 上传数据
 		if err := s.upload(ctx, m); err != nil {
 			level.Error(s.logger).Log("msg", "shipping failed", "block", m.ULID, "err", err)
 			// No error returned, just log line. This is because we want other blocks to be uploaded even
@@ -329,6 +348,7 @@ func (s *Shipper) Sync(ctx context.Context) (uploaded int, err error) {
 		return uploaded, errors.Wrap(err, "iter local block metas")
 	}
 
+	// 上传完成后，更新本地Meta
 	if err := WriteMetaFile(s.logger, s.dir, meta); err != nil {
 		level.Warn(s.logger).Log("msg", "updating meta file failed", "err", err)
 	}
@@ -345,17 +365,20 @@ func (s *Shipper) Sync(ctx context.Context) (uploaded int, err error) {
 }
 
 // sync uploads the block if not exists in remote storage.
+// 上传远端不存在的数据
 func (s *Shipper) upload(ctx context.Context, meta *metadata.Meta) error {
 	level.Info(s.logger).Log("msg", "upload new block", "id", meta.ULID)
 
 	// We hard-link the files into a temporary upload directory so we are not affected
 	// by other operations happening against the TSDB directory.
+	// 上传的数据目录
 	updir := filepath.Join(s.dir, "thanos", "upload", meta.ULID.String())
 
 	// Remove updir just in case.
 	if err := os.RemoveAll(updir); err != nil {
 		return errors.Wrap(err, "clean upload directory")
 	}
+	// 创建目录
 	if err := os.MkdirAll(updir, 0777); err != nil {
 		return errors.Wrap(err, "create upload dir")
 	}
@@ -366,6 +389,7 @@ func (s *Shipper) upload(ctx context.Context, meta *metadata.Meta) error {
 	}()
 
 	dir := filepath.Join(s.dir, meta.ULID.String())
+	// 把数据都创建一个软链
 	if err := hardlinkBlock(dir, updir); err != nil {
 		return errors.Wrap(err, "hard link block")
 	}
@@ -373,10 +397,13 @@ func (s *Shipper) upload(ctx context.Context, meta *metadata.Meta) error {
 	if lset := s.labels(); lset != nil {
 		meta.Thanos.Labels = lset.Map()
 	}
+	// 添加dataSource标签
 	meta.Thanos.Source = s.source
+	// 写meta
 	if err := metadata.Write(s.logger, updir, meta); err != nil {
 		return errors.Wrap(err, "write meta file")
 	}
+	// 上传数据，上传的软连过来的数据
 	return block.Upload(ctx, s.logger, s.bucket, updir)
 }
 
@@ -384,26 +411,33 @@ func (s *Shipper) upload(ctx context.Context, meta *metadata.Meta) error {
 // sorted by minTime asc. It logs an error and continues if it cannot access a
 // meta.json file.
 // If f returns an error, the function returns with the same error.
+// 遍历检查目录下的所有meta
 func (s *Shipper) iterBlockMetas(f func(m *metadata.Meta) error) error {
 	var metas []*metadata.Meta
+	// 读取目录下的所有文件名
 	names, err := fileutil.ReadDir(s.dir)
 	if err != nil {
 		return errors.Wrap(err, "read dir")
 	}
+	// 遍历所有文件
 	for _, n := range names {
+		// 通过UID判断是不是需要的目录
 		if _, ok := block.IsBlockDir(n); !ok {
 			continue
 		}
 		dir := filepath.Join(s.dir, n)
 
+		// 判断文件夹是否存在
 		fi, err := os.Stat(dir)
 		if err != nil {
 			level.Warn(s.logger).Log("msg", "open file failed", "err", err)
 			continue
 		}
+		// 如果不是一个目录，那么就不处理了
 		if !fi.IsDir() {
 			continue
 		}
+		// 读取Meta
 		m, err := metadata.Read(dir)
 		if err != nil {
 			level.Warn(s.logger).Log("msg", "reading meta file failed", "err", err)
@@ -411,6 +445,7 @@ func (s *Shipper) iterBlockMetas(f func(m *metadata.Meta) error) error {
 		}
 		metas = append(metas, m)
 	}
+	// 按照MinTime进行排序
 	sort.Slice(metas, func(i, j int) bool {
 		return metas[i].BlockMeta.MinTime < metas[j].BlockMeta.MinTime
 	})

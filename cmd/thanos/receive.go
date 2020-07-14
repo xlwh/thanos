@@ -31,6 +31,7 @@ import (
 	kingpin "gopkg.in/alecthomas/kingpin.v2"
 )
 
+// 注册Receive服务
 func registerReceive(m map[string]setupFunc, app *kingpin.Application) {
 	comp := component.Receive
 	cmd := app.Command(comp.String(), "Accept Prometheus remote write API requests and write to local tsdb (EXPERIMENTAL, this may change drastically without notice)")
@@ -48,11 +49,13 @@ func registerReceive(m map[string]setupFunc, app *kingpin.Application) {
 	rwClientServerCA := cmd.Flag("remote-write.client-tls-ca", "TLS CA Certificates to use to verify servers").Default("").String()
 	rwClientServerName := cmd.Flag("remote-write.client-server-name", "Server name to verify the hostname on the returned gRPC certificates. See https://tools.ietf.org/html/rfc4366#section-3.1").Default("").String()
 
+	// 数据目录
 	dataDir := cmd.Flag("tsdb.path", "Data directory of TSDB.").
 		Default("./data").String()
 
 	labelStrs := cmd.Flag("label", "External labels to announce. This flag will be removed in the future when handling multiple tsdb instances is added.").PlaceHolder("key=\"value\"").Strings()
 
+	// 对象存储
 	objStoreConfig := regCommonObjStoreFlags(cmd, "", false)
 
 	retention := modelDuration(cmd.Flag("tsdb.retention", "How long to retain raw samples on local storage. 0d - disables this retention").Default("15d"))
@@ -99,6 +102,7 @@ func registerReceive(m map[string]setupFunc, app *kingpin.Application) {
 			*local = fmt.Sprintf("http://%s:%s/api/v1/receive", hostname, port)
 		}
 
+		// 启动Reciver服务
 		return runReceive(
 			g,
 			logger,
@@ -177,6 +181,7 @@ func runReceive(
 		WALCompression:    true,
 	}
 
+	// 封装本地的TSDB
 	localStorage := &tsdb.ReadyStorage{}
 	rwTLSConfig, err := tls.NewServerConfig(log.With(logger, "protocol", "HTTP"), rwServerCert, rwServerKey, rwServerClientCA)
 	if err != nil {
@@ -186,6 +191,7 @@ func runReceive(
 	if err != nil {
 		return err
 	}
+	// HTTP 处理器
 	webHandler := receive.NewHandler(log.With(logger, "component", "receive-handler"), &receive.Options{
 		ListenAddress:     rwAddress,
 		Registry:          reg,
@@ -203,6 +209,7 @@ func runReceive(
 	if err != nil {
 		return err
 	}
+	// 也可以开启数据上传模式
 	upload := true
 	if len(confContentYaml) == 0 {
 		level.Info(logger).Log("msg", "No supported bucket was configured, uploads will be disabled")
@@ -221,6 +228,7 @@ func runReceive(
 	// uploadDone signals when uploading has finished.
 	uploadDone := make(chan struct{}, 1)
 
+	// 启动TSDB
 	level.Debug(logger).Log("msg", "setting up tsdb")
 	{
 		// TSDB.
@@ -233,6 +241,8 @@ func runReceive(
 			// Before actually starting, we need to make sure the
 			// WAL is flushed. The WAL is flushed after the
 			// hashring is loaded.
+			// 创建一个DB,这里用的也是Prometheus中的TSDB
+			// 就是在Prometheus上面封装了一层而已
 			db := receive.NewFlushableStorage(
 				dataDir,
 				log.With(logger, "component", "tsdb"),
@@ -241,12 +251,14 @@ func runReceive(
 			)
 
 			// Before quitting, ensure the WAL is flushed and the DB is closed.
+			// 服务退出之前，需要flush wal log
 			defer func() {
 				if err := db.Flush(); err != nil {
 					level.Warn(logger).Log("err", err, "msg", "failed to flush storage")
 				}
 			}()
 
+			// 一直在运行，进行DB的更新，热加载功能
 			for {
 				select {
 				case <-cancel:
@@ -279,6 +291,7 @@ func runReceive(
 		)
 	}
 
+	// 监听节点变化，一旦节点发生变化，那么就会刷出数据
 	level.Debug(logger).Log("msg", "setting up hashring")
 	{
 		// Note: the hashring configuration watcher
@@ -331,6 +344,7 @@ func runReceive(
 		)
 	}
 
+	// 启动HTTP 服务
 	level.Debug(logger).Log("msg", "setting up http server")
 	// Initiate HTTP listener providing metrics endpoint and readiness/liveness probes.
 	srv := httpserver.New(logger, reg, comp, statusProber,
@@ -339,6 +353,7 @@ func runReceive(
 	)
 	g.Add(srv.ListenAndServe, srv.Shutdown)
 
+	// 启动Grpc服务，注册查询接口？？
 	level.Debug(logger).Log("msg", "setting up grpc server")
 	{
 		var s *grpcserver.Server
@@ -355,6 +370,7 @@ func runReceive(
 				if s != nil {
 					s.Shutdown(errors.New("reload hashrings"))
 				}
+				// 启动rpc处理器
 				tsdbStore := store.NewTSDBStore(log.With(logger, "component", "thanos-tsdb-store"), nil, localStorage.Get(), component.Receive, lset)
 
 				s = grpcserver.New(logger, &receive.UnRegisterer{Registerer: reg}, tracer, comp, tsdbStore,
@@ -395,6 +411,7 @@ func runReceive(
 		)
 	}
 
+	// 启动数据上传服务
 	if upload {
 		// The background shipper continuously scans the data directory and uploads
 		// new blocks to Google Cloud Storage or an S3-compatible storage service.

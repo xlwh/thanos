@@ -33,25 +33,27 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+// 状态码定义
 var statusToCode = map[int]codes.Code{
-	http.StatusBadRequest:          codes.InvalidArgument,
-	http.StatusNotFound:            codes.NotFound,
+	http.StatusBadRequest:          codes.InvalidArgument, // 参数错误
+	http.StatusNotFound:            codes.NotFound,        // 404之类，可能是没找对需要的时间线
 	http.StatusUnprocessableEntity: codes.Internal,
-	http.StatusServiceUnavailable:  codes.Unavailable,
+	http.StatusServiceUnavailable:  codes.Unavailable, // 服务异常，5xx
 	http.StatusInternalServerError: codes.Internal,
 }
 
 // PrometheusStore implements the store node API on top of the Prometheus remote read API.
+// Prometheus RemoteRead
 type PrometheusStore struct {
-	logger         log.Logger
-	base           *url.URL
-	client         *http.Client
-	buffers        sync.Pool
+	logger         log.Logger   // 日志
+	base           *url.URL     // URL
+	client         *http.Client // client
+	buffers        sync.Pool    // Buffer对象池
 	component      component.StoreAPI
-	externalLabels func() labels.Labels
-	timestamps     func() (mint int64, maxt int64)
+	externalLabels func() labels.Labels            // 附加tag
+	timestamps     func() (mint int64, maxt int64) // 时间范围
 
-	remoteReadAcceptableResponses []prompb.ReadRequest_ResponseType
+	remoteReadAcceptableResponses []prompb.ReadRequest_ResponseType // 可以接受的返回结果
 }
 
 // NewPrometheusStore returns a new PrometheusStore that uses the given HTTP client
@@ -61,25 +63,28 @@ func NewPrometheusStore(
 	logger log.Logger,
 	client *http.Client,
 	baseURL *url.URL,
-	component component.StoreAPI,
+	component component.StoreAPI, // 传入对应的组件，每个组件都有自己的API等
 	externalLabels func() labels.Labels,
 	timestamps func() (mint int64, maxt int64),
 ) (*PrometheusStore, error) {
+	// 如果没给日志组件，那么创建日志
 	if logger == nil {
 		logger = log.NewNopLogger()
 	}
+	// 创建一个http client
 	if client == nil {
 		client = &http.Client{
 			Transport: tracing.HTTPTripperware(logger, http.DefaultTransport),
 		}
 	}
 	p := &PrometheusStore{
-		logger:                        logger,
-		base:                          baseURL,
-		client:                        client,
-		component:                     component,
-		externalLabels:                externalLabels,
-		timestamps:                    timestamps,
+		logger:         logger,
+		base:           baseURL,
+		client:         client,
+		component:      component,
+		externalLabels: externalLabels,
+		timestamps:     timestamps,
+		// 接受XOR_CHUNKS数据和SAMPLE数据
 		remoteReadAcceptableResponses: []prompb.ReadRequest_ResponseType{prompb.ReadRequest_STREAMED_XOR_CHUNKS, prompb.ReadRequest_SAMPLES},
 	}
 	return p, nil
@@ -88,6 +93,7 @@ func NewPrometheusStore(
 // Info returns store information about the Prometheus instance.
 // NOTE(bwplotka): MaxTime & MinTime are not accurate nor adjusted dynamically.
 // This is fine for now, but might be needed in future.
+// 返回Prometheus的信息
 func (p *PrometheusStore) Info(ctx context.Context, r *storepb.InfoRequest) (*storepb.InfoResponse, error) {
 	lset := p.externalLabels()
 	mint, maxt := p.timestamps()
@@ -116,6 +122,7 @@ func (p *PrometheusStore) Info(ctx context.Context, r *storepb.InfoRequest) (*st
 	return res, nil
 }
 
+// 缓存池里面存放一些buffer
 func (p *PrometheusStore) getBuffer() *[]byte {
 	b := p.buffers.Get()
 	if b == nil {
@@ -130,9 +137,11 @@ func (p *PrometheusStore) putBuffer(b *[]byte) {
 }
 
 // Series returns all series for a requested time range and label matcher.
+// 根据指定的条件，查询时序数据
 func (p *PrometheusStore) Series(r *storepb.SeriesRequest, s storepb.Store_SeriesServer) error {
 	externalLabels := p.externalLabels()
 
+	// 给对应的查询补充上tag
 	match, newMatchers, err := matchesExternalLabels(r.Matchers, externalLabels)
 	if err != nil {
 		return status.Error(codes.InvalidArgument, err.Error())
@@ -152,8 +161,10 @@ func (p *PrometheusStore) Series(r *storepb.SeriesRequest, s storepb.Store_Serie
 		r.MinTime = availableMinTime
 	}
 
+	// 构造查询请求
 	q := &prompb.Query{StartTimestampMs: r.MinTime, EndTimestampMs: r.MaxTime}
 
+	// 不太清楚这里为啥要对查询请求进行重写
 	for _, m := range newMatchers {
 		pm := &prompb.LabelMatcher{Name: m.Name, Value: m.Value}
 
@@ -172,8 +183,10 @@ func (p *PrometheusStore) Series(r *storepb.SeriesRequest, s storepb.Store_Serie
 		q.Matchers = append(q.Matchers, pm)
 	}
 
+	// 分段耗时统计
 	queryPrometheusSpan, ctx := tracing.StartSpan(s.Context(), "query_prometheus")
 
+	// 执行数据查询，返回查询结果
 	httpResp, err := p.startPromSeries(ctx, q)
 	if err != nil {
 		queryPrometheusSpan.Finish()
@@ -190,14 +203,20 @@ func (p *PrometheusStore) Series(r *storepb.SeriesRequest, s storepb.Store_Serie
 	if !strings.HasPrefix(contentType, "application/x-streamed-protobuf; proto=prometheus.ChunkedReadResponse") {
 		return errors.Errorf("not supported remote read content type: %s", contentType)
 	}
+
+	// 处理返回结果,流返回
 	return p.handleStreamedPrometheusResponse(s, httpResp, queryPrometheusSpan, externalLabels)
 }
 
+// 解析Proto结果
 func (p *PrometheusStore) handleSampledPrometheusResponse(s storepb.Store_SeriesServer, httpResp *http.Response, querySpan opentracing.Span, externalLabels labels.Labels) error {
 	ctx := s.Context()
 
 	level.Debug(p.logger).Log("msg", "started handling ReadRequest_SAMPLED response type.")
 
+	// 解压返回的数据，取到如下的数据
+	//  []Label  `protobuf:"bytes,1,rep,name=labels,proto3" json:"labels"`
+	//	[]Sample `protobuf:"bytes,2,rep,name=samples,proto3" json:"samples"`
 	resp, err := p.fetchSampledResponse(ctx, httpResp)
 	querySpan.Finish()
 	if err != nil {
@@ -208,9 +227,13 @@ func (p *PrometheusStore) handleSampledPrometheusResponse(s storepb.Store_Series
 	defer span.Finish()
 	span.SetTag("series_count", len(resp.Results[0].Timeseries))
 
+	// 进行查询结果的转换, 这里只支持Results数组里面为1的场景，可能会有一些问题吧？？
+	// 暂时不知道会不会有问题呢
 	for _, e := range resp.Results[0].Timeseries {
+		// 补充上自定义的tag
 		lset := p.translateAndExtendLabels(e.Labels, externalLabels)
 
+		// 如果没查到数据点，就直接报错
 		if len(e.Samples) == 0 {
 			// As found in https://github.com/thanos-io/thanos/issues/381
 			// Prometheus can give us completely empty time series. Ignore these with log until we figure out that
@@ -227,11 +250,15 @@ func (p *PrometheusStore) handleSampledPrometheusResponse(s storepb.Store_Series
 		// XOR encoding supports a max size of 2^16 - 1 samples, so we need
 		// to chunk all samples into groups of no more than 2^16 - 1
 		// See: https://github.com/thanos-io/thanos/pull/718.
+		// 把查到的数据进行压缩
 		aggregatedChunks, err := p.chunkSamples(e, math.MaxUint16)
 		if err != nil {
 			return err
 		}
 
+		// 把压缩后的数据发送出去
+		// 	Labels []Label     `protobuf:"bytes,1,rep,name=labels,proto3" json:"labels"`
+		//	Chunks []AggrChunk `protobuf:"bytes,2,rep,name=chunks,proto3" json:"chunks"`
 		if err := s.Send(storepb.NewSeriesResponse(&storepb.Series{
 			Labels: lset,
 			Chunks: aggregatedChunks,
@@ -335,6 +362,7 @@ func (p *PrometheusStore) fetchSampledResponse(ctx context.Context, resp *http.R
 	}
 	spanSnappyDecode, ctx := tracing.StartSpan(ctx, "decompress_response")
 	sb := p.getBuffer()
+	// 解压返回结果
 	decomp, err := snappy.Decode(*sb, buf.Bytes())
 	spanSnappyDecode.Finish()
 	defer p.putBuffer(sb)
@@ -344,6 +372,7 @@ func (p *PrometheusStore) fetchSampledResponse(ctx context.Context, resp *http.R
 
 	var data prompb.ReadResponse
 	spanUnmarshal, _ := tracing.StartSpan(ctx, "unmarshal_response")
+	// 解析proto数据
 	if err := proto.Unmarshal(decomp, &data); err != nil {
 		return nil, errors.Wrap(err, "unmarshal response")
 	}
@@ -364,6 +393,7 @@ func (p *PrometheusStore) chunkSamples(series *prompb.TimeSeries, maxSamplesPerC
 			chunkSize = maxSamplesPerChunk
 		}
 
+		// 把数据进行压缩，使用Gorila算法进行压缩
 		enc, cb, err := p.encodeChunk(samples[:chunkSize])
 		if err != nil {
 			return nil, status.Error(codes.Unknown, err.Error())
@@ -381,7 +411,9 @@ func (p *PrometheusStore) chunkSamples(series *prompb.TimeSeries, maxSamplesPerC
 	return chks, nil
 }
 
+// 调用Prometheus的Remote read,进行数据查询
 func (p *PrometheusStore) startPromSeries(ctx context.Context, q *prompb.Query) (*http.Response, error) {
+	// 把查询请求封装成为一个RPC请求,Grpc
 	reqb, err := proto.Marshal(&prompb.ReadRequest{
 		Queries:               []*prompb.Query{q},
 		AcceptedResponseTypes: p.remoteReadAcceptableResponses,
@@ -390,22 +422,26 @@ func (p *PrometheusStore) startPromSeries(ctx context.Context, q *prompb.Query) 
 		return nil, errors.Wrap(err, "marshal read request")
 	}
 
-	u := *p.base
-	u.Path = path.Join(u.Path, "api/v1/read")
+	u := *p.base                              // 请求地址
+	u.Path = path.Join(u.Path, "api/v1/read") // 请求路径
 
 	preq, err := http.NewRequest("POST", u.String(), bytes.NewReader(snappy.Encode(nil, reqb)))
 	if err != nil {
 		return nil, errors.Wrap(err, "unable to create request")
 	}
+	// 设置HttpHeader
 	preq.Header.Add("Content-Encoding", "snappy")
 	preq.Header.Set("Content-Type", "application/x-stream-protobuf")
+	// 启动一些耗时统计
 	spanReqDo, ctx := tracing.StartSpan(ctx, "query_prometheus_request")
 	preq = preq.WithContext(ctx)
+	// 执行HTTP请求
 	presp, err := p.client.Do(preq)
 	if err != nil {
 		return nil, errors.Wrap(err, "send request")
 	}
 	spanReqDo.Finish()
+	// HTTP code == 2xx才算是正常的
 	if presp.StatusCode/100 != 2 {
 		// Best effort read.
 		b, err := ioutil.ReadAll(presp.Body)
@@ -416,11 +452,13 @@ func (p *PrometheusStore) startPromSeries(ctx context.Context, q *prompb.Query) 
 		return nil, errors.Errorf("request failed with code %s; msg %s", presp.Status, string(b))
 	}
 
+	// 正常的情况下，读取body，返回
 	return presp, nil
 }
 
 // matchesExternalLabels filters out external labels matching from matcher if exsits as the local storage does not have them.
 // It also returns false if given matchers are not matching external labels.
+// 给对应的filter补充上我们自定义的一些tag
 func matchesExternalLabels(ms []storepb.LabelMatcher, externalLabels labels.Labels) (bool, []storepb.LabelMatcher, error) {
 	if len(externalLabels) == 0 {
 		return true, ms, nil
@@ -429,6 +467,7 @@ func matchesExternalLabels(ms []storepb.LabelMatcher, externalLabels labels.Labe
 	var newMatcher []storepb.LabelMatcher
 	for _, m := range ms {
 		// Validate all matchers.
+		// 验证查询filter条件是否正确
 		tm, err := translateMatcher(m)
 		if err != nil {
 			return false, nil, err

@@ -97,8 +97,8 @@ type ApiFunc func(r *http.Request) (interface{}, []error, *ApiError)
 // them using the provided storage and query engine.
 type API struct {
 	logger          log.Logger
-	queryableCreate query.QueryableCreator
-	queryEngine     *promql.Engine
+	queryableCreate query.QueryableCreator // 关键部分，拉取数据的引擎
+	queryEngine     *promql.Engine         // 计算引擎
 
 	enableAutodownsampling                 bool
 	enablePartialResponse                  bool
@@ -135,6 +135,7 @@ func NewAPI(
 }
 
 // Register the API's endpoints in the given router.
+// 注册prometheus接口
 func (api *API) Register(r *route.Router, tracer opentracing.Tracer, logger log.Logger, ins extpromhttp.InstrumentationMiddleware) {
 	instr := func(name string, f ApiFunc) http.HandlerFunc {
 		hf := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -244,7 +245,9 @@ func (api *API) options(r *http.Request) (interface{}, []error, *ApiError) {
 	return nil, nil, nil
 }
 
+// 查询请求处理
 func (api *API) query(r *http.Request) (interface{}, []error, *ApiError) {
+	// 解析请求参数
 	var ts time.Time
 	if t := r.FormValue("time"); t != "" {
 		var err error
@@ -292,11 +295,13 @@ func (api *API) query(r *http.Request) (interface{}, []error, *ApiError) {
 	span, ctx := tracing.StartSpan(ctx, "promql_instant_query")
 	defer span.Finish()
 
+	// 创建一个query
 	qry, err := api.queryEngine.NewInstantQuery(api.queryableCreate(enableDedup, replicaLabels, maxSourceResolution, enablePartialResponse), r.FormValue("query"), ts)
 	if err != nil {
 		return nil, nil, &ApiError{errorBadData, err}
 	}
 
+	// 执行查询
 	res := qry.Exec(ctx)
 	if res.Err != nil {
 		switch res.Err.(type) {
@@ -310,6 +315,7 @@ func (api *API) query(r *http.Request) (interface{}, []error, *ApiError) {
 		return nil, nil, &ApiError{errorExec, res.Err}
 	}
 
+	// 封装结果
 	return &queryData{
 		ResultType: res.Value.Type(),
 		Result:     res.Value,

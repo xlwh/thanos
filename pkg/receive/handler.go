@@ -192,8 +192,7 @@ func (h *Handler) Run() error {
 	return httpSrv.Serve(h.listener)
 }
 
-// replica encapsulates the replica number of a request and if the request is
-// already replicated.
+// replica encapsulates the replica number of a request and if the request is already replicated.
 type replica struct {
 	n          uint64
 	replicated bool
@@ -258,6 +257,7 @@ func (h *Handler) receive(w http.ResponseWriter, r *http.Request) {
 // unless the request needs to be replicated.
 // The function only returns when all requests have finished
 // or the context is canceled.
+// 转发写入请求，按照hash进行数据转发，保证一个TSDB处理自己的数据
 func (h *Handler) forward(ctx context.Context, tenant string, r replica, wreq *prompb.WriteRequest) error {
 	wreqs := make(map[string]*prompb.WriteRequest)
 	replicas := make(map[string]replica)

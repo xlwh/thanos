@@ -82,12 +82,14 @@ func UploadDir(ctx context.Context, logger log.Logger, bkt Bucket, srcdir, dstdi
 // UploadFile uploads the file with the given name to the bucket.
 // It is a caller responsibility to clean partial upload in case of failure.
 func UploadFile(ctx context.Context, logger log.Logger, bkt Bucket, src, dst string) error {
+	// 打开文件
 	r, err := os.Open(src)
 	if err != nil {
 		return errors.Wrapf(err, "open file %s", src)
 	}
 	defer runutil.CloseWithLogOnErr(logger, r, "close file %s", src)
 
+	// 调用对应的接口，进行数据长传
 	if err := bkt.Upload(ctx, dst, r); err != nil {
 		return errors.Wrapf(err, "upload file %s as %s", src, dst)
 	}

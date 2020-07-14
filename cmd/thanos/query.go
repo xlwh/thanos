@@ -42,10 +42,12 @@ import (
 )
 
 // registerQuery registers a query command.
+// 注册查询组件
 func registerQuery(m map[string]setupFunc, app *kingpin.Application) {
-	comp := component.Query
+	comp := component.Query // 指定组件是Query组件，注册一下这个组件里面的一些API
 	cmd := app.Command(comp.String(), "query node exposing PromQL enabled Query API with data retrieved from multiple store nodes")
 
+	// 从Flag中读取一些flag参数
 	httpBindAddr, httpGracePeriod := regHTTPFlags(cmd)
 	grpcBindAddr, grpcGracePeriod, grpcCert, grpcKey, grpcClientCA := regGRPCFlags(cmd)
 
@@ -101,12 +103,15 @@ func registerQuery(m map[string]setupFunc, app *kingpin.Application) {
 
 	storeResponseTimeout := modelDuration(cmd.Flag("store.response-timeout", "If a Store doesn't send any data in this specified duration then a Store will be ignored and partial data will be returned if it's enabled. 0 disables timeout.").Default("0ms"))
 
+	// 运行服务，启动查询服务
 	m[comp.String()] = func(g *run.Group, logger log.Logger, reg *prometheus.Registry, tracer opentracing.Tracer, _ bool) error {
+		// 指定这个query服务只查某些对应的sidecar
 		selectorLset, err := parseFlagLabels(*selectorLabels)
 		if err != nil {
 			return errors.Wrap(err, "parse federation labels")
 		}
 
+		// 指定好的存储，可以是一个sidecar组件，用RPC协议交互 --store=127.0.0.1:10901
 		lookupStores := map[string]struct{}{}
 		for _, s := range *stores {
 			if _, ok := lookupStores[s]; ok {
@@ -116,6 +121,7 @@ func registerQuery(m map[string]setupFunc, app *kingpin.Application) {
 			lookupStores[s] = struct{}{}
 		}
 
+		// 如果指定了服务发现，那么就启动SD
 		var fileSD *file.Discovery
 		if len(*fileSDFiles) > 0 {
 			conf := &file.SDConfig{
@@ -127,6 +133,7 @@ func registerQuery(m map[string]setupFunc, app *kingpin.Application) {
 
 		promql.SetDefaultEvaluationInterval(time.Duration(*defaultEvaluationInterval))
 
+		// 运行查询服务
 		return runQuery(
 			g,
 			logger,
@@ -166,10 +173,12 @@ func registerQuery(m map[string]setupFunc, app *kingpin.Application) {
 }
 
 func storeClientGRPCOpts(logger log.Logger, reg *prometheus.Registry, tracer opentracing.Tracer, secure bool, cert, key, caCert, serverName string) ([]grpc.DialOption, error) {
+	// 注册监控指标
 	grpcMets := grpc_prometheus.NewClientMetrics()
 	grpcMets.EnableClientHandlingTimeHistogram(
 		grpc_prometheus.WithHistogramBuckets(prometheus.ExponentialBuckets(0.001, 2, 15)),
 	)
+	// 创建grpc的一些选项
 	dialOpts := []grpc.DialOption{
 		// We want to make sure that we can receive huge gRPC messages from storeAPI.
 		// On TCP level we can be fine, but the gRPC overhead for huge messages could be significant.
@@ -209,11 +218,12 @@ func storeClientGRPCOpts(logger log.Logger, reg *prometheus.Registry, tracer ope
 
 // runQuery starts a server that exposes PromQL Query API. It is responsible for querying configured
 // store nodes, merging and duplicating the data to satisfy user query.
+// 处理PromQL
 func runQuery(
-	g *run.Group,
-	logger log.Logger,
-	reg *prometheus.Registry,
-	tracer opentracing.Tracer,
+	g *run.Group, // group
+	logger log.Logger, // 日志组件
+	reg *prometheus.Registry, // 监控注册
+	tracer opentracing.Tracer, // trace
 	grpcBindAddr string,
 	grpcGracePeriod time.Duration,
 	grpcCert string,
@@ -223,40 +233,44 @@ func runQuery(
 	cert string,
 	key string,
 	caCert string,
-	serverName string,
+	serverName string, // 组件名称，比如query
 	httpBindAddr string,
 	httpGracePeriod time.Duration,
 	webRoutePrefix string,
 	webExternalPrefix string,
 	webPrefixHeaderName string,
-	maxConcurrentQueries int,
+	maxConcurrentQueries int, // 最大并发查询
 	queryTimeout time.Duration,
 	storeResponseTimeout time.Duration,
-	replicaLabels []string,
+	replicaLabels []string, // replica tag，可能是用来进行数据去重逻辑的吧
 	selectorLset labels.Labels,
 	storeAddrs []string,
 	enableAutodownsampling bool,
 	enablePartialResponse bool,
-	fileSD *file.Discovery,
+	fileSD *file.Discovery, //  服务发现
 	dnsSDInterval time.Duration,
 	dnsSDResolver string,
 	unhealthyStoreTimeout time.Duration,
 	instantDefaultMaxSourceResolution time.Duration,
-	comp component.Component,
+	comp component.Component, // 组件的一些API服务绑定
 ) error {
 	// TODO(bplotka in PR #513 review): Move arguments into struct.
 	duplicatedStores := prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "thanos_query_duplicated_store_address",
 		Help: "The number of times a duplicated store addresses is detected from the different configs in query",
 	})
+	// 注册监控指标
 	reg.MustRegister(duplicatedStores)
 
+	// 设置Grpc的一些参数和选项
 	dialOpts, err := storeClientGRPCOpts(logger, reg, tracer, secure, cert, key, caCert, serverName)
 	if err != nil {
 		return errors.Wrap(err, "building gRPC client")
 	}
 
+	// 创建一个本地的服务缓存，缓存一组后端列表
 	fileSDCache := cache.New()
+	// 创建DNS解析器，Miekgdns和go自带的DNS解析
 	dnsProvider := dns.NewProvider(
 		logger,
 		extprom.WrapRegistererWithPrefix("thanos_querier_store_apis_", reg),
@@ -267,6 +281,9 @@ func runQuery(
 		stores = query.NewStoreSet(
 			logger,
 			reg,
+
+			// 把给定的后端都创建起来
+			// 只要实现好对应的接口就行
 			func() (specs []query.StoreSpec) {
 				// Add DNS resolved addresses from static flags and file SD.
 				for _, addr := range dnsProvider.Addresses() {
@@ -280,9 +297,11 @@ func runQuery(
 			dialOpts,
 			unhealthyStoreTimeout,
 		)
+		// proxy组件
 		proxy            = store.NewProxyStore(logger, stores.Get, component.Query, selectorLset, storeResponseTimeout)
 		queryableCreator = query.NewQueryableCreator(logger, proxy)
-		engine           = promql.NewEngine(
+		// 创建引擎，直接用的是Prometheus里面的engine
+		engine = promql.NewEngine(
 			promql.EngineOpts{
 				Logger:        logger,
 				Reg:           reg,
@@ -294,6 +313,7 @@ func runQuery(
 		)
 	)
 	// Periodically update the store set with the addresses we see in our cluster.
+	// 每5s更新一下后端
 	{
 		ctx, cancel := context.WithCancel(context.Background())
 		g.Add(func() error {
@@ -354,7 +374,7 @@ func runQuery(
 		})
 	}
 	// Start query API + UI HTTP server.
-
+	// 启动HTTP 服务
 	statusProber := prober.NewProber(comp, logger, reg)
 	{
 		router := route.New()
@@ -373,6 +393,7 @@ func runQuery(
 		}
 
 		ins := extpromhttp.NewInstrumentationMiddleware(reg)
+		// 启动UI界面
 		ui.NewQueryUI(logger, reg, stores, flagsMap).Register(router.WithPrefix(webRoutePrefix), ins)
 
 		api := v1.NewAPI(logger, reg, engine, queryableCreator, enableAutodownsampling, enablePartialResponse, replicaLabels, instantDefaultMaxSourceResolution)
@@ -384,6 +405,7 @@ func runQuery(
 			httpserver.WithListen(httpBindAddr),
 			httpserver.WithGracePeriod(httpGracePeriod),
 		)
+		// 注册请求处理器
 		srv.Handle("/", router)
 
 		g.Add(srv.ListenAndServe, srv.Shutdown)

@@ -62,6 +62,7 @@ func Download(ctx context.Context, logger log.Logger, bucket objstore.Bucket, id
 // It makes sure cleanup is done on error to avoid partial block uploads.
 // It also verifies basic features of Thanos block.
 // TODO(bplotka): Ensure bucket operations have reasonable backoff retries.
+// 上传数据
 func Upload(ctx context.Context, logger log.Logger, bkt objstore.Bucket, bdir string) error {
 	df, err := os.Stat(bdir)
 	if err != nil {
@@ -77,6 +78,14 @@ func Upload(ctx context.Context, logger log.Logger, bkt objstore.Bucket, bdir st
 		return errors.Wrap(err, "not a block dir")
 	}
 
+	/*
+			 - meta.json
+			 - chunks
+		     	- 0001
+		     - index
+	*/
+
+	// 读取Meta
 	meta, err := metadata.Read(bdir)
 	if err != nil {
 		// No meta or broken meta file.
@@ -87,14 +96,17 @@ func Upload(ctx context.Context, logger log.Logger, bkt objstore.Bucket, bdir st
 		return errors.Errorf("empty external labels are not allowed for Thanos block.")
 	}
 
+	// 上传Meta文件  meta.json
 	if err := objstore.UploadFile(ctx, logger, bkt, path.Join(bdir, MetaFilename), path.Join(DebugMetas, fmt.Sprintf("%s.json", id))); err != nil {
 		return errors.Wrap(err, "upload meta file to debug dir")
 	}
 
+	// 上传chunk文件夹 chunks
 	if err := objstore.UploadDir(ctx, logger, bkt, path.Join(bdir, ChunksDirname), path.Join(id.String(), ChunksDirname)); err != nil {
 		return cleanUp(logger, bkt, id, errors.Wrap(err, "upload chunks"))
 	}
 
+	// 上传索引 index
 	if err := objstore.UploadFile(ctx, logger, bkt, path.Join(bdir, IndexFilename), path.Join(id.String(), IndexFilename)); err != nil {
 		return cleanUp(logger, bkt, id, errors.Wrap(err, "upload index"))
 	}
@@ -107,6 +119,7 @@ func Upload(ctx context.Context, logger log.Logger, bkt objstore.Bucket, bdir st
 
 	// Meta.json always need to be uploaded as a last item. This will allow to assume block directories without meta file
 	// to be pending uploads.
+	// Meta为啥要上传两次？？
 	if err := objstore.UploadFile(ctx, logger, bkt, path.Join(bdir, MetaFilename), path.Join(id.String(), MetaFilename)); err != nil {
 		return cleanUp(logger, bkt, id, errors.Wrap(err, "upload meta file"))
 	}

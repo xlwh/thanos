@@ -29,6 +29,7 @@ func TestHash(t *testing.T) {
 	}
 }
 
+// 测试
 func TestHashringGet(t *testing.T) {
 	ts := &prompb.TimeSeries{
 		Labels: []prompb.Label{

@@ -74,6 +74,7 @@ func New(logger log.Logger, reg prometheus.Registerer, tracer opentracing.Tracer
 	if options.tlsConfig != nil {
 		grpcOpts = append(grpcOpts, grpc.Creds(credentials.NewTLS(options.tlsConfig)))
 	}
+	// 创建一个grpc服务
 	s := grpc.NewServer(grpcOpts...)
 
 	storepb.RegisterStoreServer(s, storeSrv)

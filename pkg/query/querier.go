@@ -160,15 +160,19 @@ func aggrsFromFunc(f string) ([]storepb.Aggr, resAggr) {
 	return []storepb.Aggr{storepb.Aggr_COUNT, storepb.Aggr_SUM}, resAggrAvg
 }
 
+// 查询数据，传入一些tag和时间戳等，查询到数据点
 func (q *querier) Select(params *storage.SelectParams, ms ...*labels.Matcher) (storage.SeriesSet, storage.Warnings, error) {
+	// 一些耗时统计，方便本地做一些trace
 	span, ctx := tracing.StartSpan(q.ctx, "querier_select")
 	defer span.Finish()
 
+	// 查询转换
 	sms, err := translateMatchers(ms...)
 	if err != nil {
 		return nil, nil, errors.Wrap(err, "convert matchers")
 	}
 
+	// 开始结束时间
 	if params == nil {
 		params = &storage.SelectParams{
 			Start: q.mint,
@@ -177,13 +181,14 @@ func (q *querier) Select(params *storage.SelectParams, ms ...*labels.Matcher) (s
 	}
 	queryAggrs, resAggr := aggrsFromFunc(params.Func)
 
+	// 调用Proxy，从proxy中查询数据
 	resp := &seriesServer{ctx: ctx}
 	if err := q.proxy.Series(&storepb.SeriesRequest{
 		MinTime:                 params.Start,
 		MaxTime:                 params.End,
 		Matchers:                sms,
-		MaxResolutionWindow:     q.maxResolutionMillis,
-		Aggregates:              queryAggrs,
+		MaxResolutionWindow:     q.maxResolutionMillis, // downsample interval
+		Aggregates:              queryAggrs,            // 聚合参数
 		PartialResponseDisabled: !q.partialResponse,
 	}, resp); err != nil {
 		return nil, nil, errors.Wrap(err, "proxy Series()")

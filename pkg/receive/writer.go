@@ -84,6 +84,7 @@ func (r *Writer) Write(wreq *prompb.WriteRequest) error {
 		errs.Add(errors.Wrapf(storage.ErrOutOfBounds, "failed to non-fast add %d samples", numOutOfBounds))
 	}
 
+	// 提交数据到存储中
 	if err := app.Commit(); err != nil {
 		errs.Add(errors.Wrap(err, "commit samples"))
 	}

@@ -33,6 +33,7 @@ func New(logger log.Logger, reg *prometheus.Registry, comp component.Component, 
 		o.apply(&options)
 	}
 
+	// 注册上Profile和metrics接口
 	mux := http.NewServeMux()
 	registerMetrics(mux, reg)
 	registerProfiler(mux)

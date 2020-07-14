@@ -180,7 +180,9 @@ func (s ctxRespSender) send(r *storepb.SeriesResponse) {
 
 // Series returns all series for a requested time range and label matcher. Requested series are taken from other
 // stores and proxied to RPC client. NOTE: Resulted data are not trimmed exactly to min and max time range.
+// 查询时序数据都走的这个
 func (s *ProxyStore) Series(r *storepb.SeriesRequest, srv storepb.Store_SeriesServer) error {
+	// 查询都要补充上自定义的一些tag
 	match, newMatchers, err := matchesExternalLabels(r.Matchers, s.selectorLabels)
 	if err != nil {
 		return status.Error(codes.InvalidArgument, err.Error())
@@ -193,6 +195,7 @@ func (s *ProxyStore) Series(r *storepb.SeriesRequest, srv storepb.Store_SeriesSe
 		return status.Error(codes.InvalidArgument, errors.New("no matchers specified (excluding external labels)").Error())
 	}
 
+	// 创建chan，用来接收异步的数据返回
 	var (
 		g, gctx = errgroup.WithContext(srv.Context())
 
@@ -201,31 +204,36 @@ func (s *ProxyStore) Series(r *storepb.SeriesRequest, srv storepb.Store_SeriesSe
 		respSender, respRecv, closeFn = newRespCh(gctx, 10)
 	)
 
+	// 异步执行数据拉取
 	g.Go(func() error {
 		var (
-			seriesSet      []storepb.SeriesSet
-			storeDebugMsgs []string
-			r              = &storepb.SeriesRequest{
-				MinTime:                 r.MinTime,
-				MaxTime:                 r.MaxTime,
-				Matchers:                newMatchers,
-				Aggregates:              r.Aggregates,
-				MaxResolutionWindow:     r.MaxResolutionWindow,
-				PartialResponseDisabled: r.PartialResponseDisabled,
+			seriesSet      []storepb.SeriesSet       // 返回结果
+			storeDebugMsgs []string                  // debug 消息
+			r              = &storepb.SeriesRequest{ // 查询请求
+				MinTime:             r.MinTime,             // 开始时间
+				MaxTime:             r.MaxTime,             // 结束时间
+				Matchers:            newMatchers,           // 查询Filter
+				Aggregates:          r.Aggregates,          // 聚合函数
+				MaxResolutionWindow: r.MaxResolutionWindow, // 类似于Downsample interval
+				//PartialResponseDisabled: r.PartialResponseDisabled,		// 这个好像没啥用了，可以去掉了
 			}
-			wg = &sync.WaitGroup{}
+			wg = &sync.WaitGroup{} // 异步计算控制器
 		)
 
+		// 等待返回
 		defer func() {
 			wg.Wait()
 			closeFn()
 		}()
 
+		// 广播读，把所有的后端都读查一遍
 		for _, st := range s.stores() {
 			// We might be able to skip the store if its meta information indicates
 			// it cannot have series matching our query.
 			// NOTE: all matchers are validated in matchesExternalLabels method so we explicitly ignore error.
 			spanStoreMathes, gctx := tracing.StartSpan(gctx, "store_matches")
+			// 通过maxTime、minTime和一些tag，过滤掉一部分后端
+			// 尽量减少一些不必要的查询
 			ok, _ := storeMatches(st, r.MinTime, r.MaxTime, r.Matchers...)
 			spanStoreMathes.Finish()
 			if !ok {
@@ -241,6 +249,7 @@ func (s *ProxyStore) Series(r *storepb.SeriesRequest, srv storepb.Store_SeriesSe
 			})
 			defer closeSeries()
 
+			// 执行查询
 			sc, err := st.Series(seriesCtx, r)
 			if err != nil {
 				storeID := storepb.LabelSetsToString(st.LabelSets())
@@ -271,6 +280,7 @@ func (s *ProxyStore) Series(r *storepb.SeriesRequest, srv storepb.Store_SeriesSe
 			return nil
 		}
 
+		// 数据去重
 		mergedSet := storepb.MergeSeriesSets(seriesSet...)
 		for mergedSet.Next() {
 			var series storepb.Series

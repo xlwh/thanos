@@ -420,6 +420,7 @@ func (s *BucketStore) InitialSync(ctx context.Context) error {
 		return errors.Wrap(err, "sync block")
 	}
 
+	//
 	names, err := fileutil.ReadDir(s.dir)
 	if err != nil {
 		return errors.Wrap(err, "read dir")
@@ -1176,13 +1177,13 @@ type bucketBlock struct {
 	bucket     objstore.BucketReader
 	meta       *metadata.Meta
 	dir        string
-	indexCache indexCache
+	indexCache indexCache // 索引缓存
 	chunkPool  *pool.BytesPool
 
 	indexVersion int
 	symbols      []string
 	lvals        map[string][]string
-	postings     map[labels.Label]index.Range
+	postings     map[labels.Label]index.Range // 倒排索引
 
 	chunkObjs []string
 

@@ -33,18 +33,23 @@ import (
 	"gopkg.in/alecthomas/kingpin.v2"
 )
 
+// 注册组件，传入命令行参数
 func registerSidecar(m map[string]setupFunc, app *kingpin.Application) {
 	cmd := app.Command(component.Sidecar.String(), "sidecar for Prometheus server")
 
+	// HTTP参数和GRPC参数
 	httpBindAddr, httpGracePeriod := regHTTPFlags(cmd)
 	grpcBindAddr, grpcGracePeriod, grpcCert, grpcKey, grpcClientCA := regGRPCFlags(cmd)
 
+	// Promtheus地址
 	promURL := cmd.Flag("prometheus.url", "URL at which to reach Prometheus's API. For better performance use local network.").
 		Default("http://localhost:9090").URL()
 
+	// Prometheus读超时时间
 	promReadyTimeout := cmd.Flag("prometheus.ready_timeout", "Maximum time to wait for the Prometheus instance to start up").
 		Default("10m").Duration()
 
+	// Prometheus数据保存路径
 	dataDir := cmd.Flag("tsdb.path", "Data directory of TSDB.").
 		Default("./data").String()
 
@@ -72,6 +77,7 @@ func registerSidecar(m map[string]setupFunc, app *kingpin.Application) {
 			*reloaderRuleDirs,
 		)
 
+		// 运行组件
 		return runSidecar(
 			g,
 			logger,
@@ -97,26 +103,27 @@ func registerSidecar(m map[string]setupFunc, app *kingpin.Application) {
 }
 
 func runSidecar(
-	g *run.Group,
-	logger log.Logger,
-	reg *prometheus.Registry,
+	g *run.Group, // 进程组？？
+	logger log.Logger, // 日志组件
+	reg *prometheus.Registry, // 自身监控注册
 	tracer opentracing.Tracer,
-	grpcBindAddr string,
+	grpcBindAddr string, // grpc的监听地址
 	grpcGracePeriod time.Duration,
-	grpcCert string,
+	grpcCert string, // Grpc的一些HTTPS相关的设置
 	grpcKey string,
 	grpcClientCA string,
-	httpBindAddr string,
+	httpBindAddr string, // HTTP 相关的一些配置
 	httpGracePeriod time.Duration,
-	promURL *url.URL,
+	promURL *url.URL, // prometheus的地址，拉取一些数据，是否把Prometheus作为RemoteRead??
 	promReadyTimeout time.Duration,
-	dataDir string,
+	dataDir string, // 数据保存的目录
 	objStoreConfig *extflag.PathOrContent,
 	reloader *reloader.Reloader,
-	uploadCompacted bool,
+	uploadCompacted bool, // 是否上传历史已经压缩过的数据
 	comp component.Component,
 	limitMinTime thanosmodel.TimeOrDurationValue,
 ) error {
+	// Prometheus的Meta数据
 	var m = &promMetadata{
 		promURL: promURL,
 
@@ -128,11 +135,14 @@ func runSidecar(
 		limitMinTime: limitMinTime,
 	}
 
+	// 对象存储的配置，包括地址、账号、密码等
 	confContentYaml, err := objStoreConfig.Content()
 	if err != nil {
 		return errors.Wrap(err, "getting object store config")
 	}
 
+	// 默认不开启数据上传对象存储的功能
+	// 只有当把对象存储配置上以后，才会开启这个功能
 	var uploads = true
 	if len(confContentYaml) == 0 {
 		level.Info(logger).Log("msg", "no supported bucket was configured, uploads will be disabled")
@@ -140,6 +150,7 @@ func runSidecar(
 	}
 
 	// Initiate HTTP listener providing metrics endpoint and readiness/liveness probes.
+	// 初始化和启动HTTP 服务,封装了状态探针的HTTP服务
 	statusProber := prober.NewProber(comp, logger, prometheus.WrapRegistererWithPrefix("thanos_", reg))
 	srv := httpserver.New(logger, reg, comp, statusProber,
 		httpserver.WithListen(httpBindAddr),
@@ -158,11 +169,13 @@ func runSidecar(
 			Name: "thanos_sidecar_last_heartbeat_success_time_seconds",
 			Help: "Second timestamp of the last successful heartbeat.",
 		})
+		// 注册心跳服务？？
 		reg.MustRegister(promUp, lastHeartbeat)
 
 		ctx, cancel := context.WithCancel(context.Background())
 		g.Add(func() error {
 			// Only check Prometheus's flags when upload is enabled.
+			// 如果需要上传数据，那么需要校验prometheus里面的东西
 			if uploads {
 				// Check prometheus's flags to ensure sane sidecar flags.
 				if err := validatePrometheus(ctx, logger, m); err != nil {
@@ -172,7 +185,9 @@ func runSidecar(
 
 			// Blocking query of external labels before joining as a Source Peer into gossip.
 			// We retry infinitely until we reach and fetch labels from our Prometheus.
+			// 从Prometheus中拉取一些label
 			err := runutil.Retry(2*time.Second, ctx.Done(), func() error {
+				// 从Prometheus中拉取一些配置，暂时不知道是做什么用的
 				if err := m.UpdateLabels(ctx, logger); err != nil {
 					level.Warn(logger).Log(
 						"msg", "failed to fetch initial external labels. Is Prometheus running? Retrying",
@@ -187,6 +202,7 @@ func runSidecar(
 					"msg", "successfully loaded prometheus external labels",
 					"external_labels", m.Labels().String(),
 				)
+				// 设置服务状态为ready
 				promUp.Set(1)
 				statusProber.SetReady()
 				lastHeartbeat.Set(float64(time.Now().UnixNano()) / 1e9)
@@ -202,6 +218,7 @@ func runSidecar(
 
 			// Periodically query the Prometheus config. We use this as a heartbeat as well as for updating
 			// the external labels we apply.
+			// 每30s进行一次心跳上报
 			return runutil.Repeat(30*time.Second, ctx.Done(), func() error {
 				iterCtx, iterCancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer iterCancel()
@@ -229,6 +246,7 @@ func runSidecar(
 		})
 	}
 
+	// 下面这段代码是启动我们的Grpc服务
 	{
 		promStore, err := store.NewPrometheusStore(
 			logger, nil, promURL, component.Sidecar, m.Labels, m.Timestamps)
@@ -241,11 +259,18 @@ func runSidecar(
 			return errors.Wrap(err, "setup gRPC server")
 		}
 
+		// 启动Grpc服务
+		// 有如下的几个方法
+		// 服务信息 Info(context.Context, *InfoRequest) (*InfoResponse, error)
+		// 时序数据查询 Series(*SeriesRequest, Store_SeriesServer) error
+		// tagK 查询  LabelNames(context.Context, *LabelNamesRequest) (*LabelNamesResponse, error)
+		// tagV 查询  LabelValues(context.Context, *LabelValuesRequest) (*LabelValuesResponse, error)
 		s := grpcserver.New(logger, reg, tracer, comp, promStore,
 			grpcserver.WithListen(grpcBindAddr),
 			grpcserver.WithGracePeriod(grpcGracePeriod),
 			grpcserver.WithTLSConfig(tlsCfg),
 		)
+		// 启动Grpc服务，进行监听，等待请求，一般是把Slidecar作为Proxy组件的时候有用
 		g.Add(func() error {
 			statusProber.SetReady()
 			return s.ListenAndServe()
@@ -255,9 +280,11 @@ func runSidecar(
 		})
 	}
 
+	// 启动Upload服务
 	if uploads {
 		// The background shipper continuously scans the data directory and uploads
 		// new blocks to Google Cloud Storage or an S3-compatible storage service.
+		// 根据配置，创建后端对象存储
 		bkt, err := client.NewBucket(logger, confContentYaml, reg, component.Sidecar.String())
 		if err != nil {
 			return err
@@ -281,6 +308,8 @@ func runSidecar(
 			extLabelsCtx, cancel := context.WithTimeout(ctx, promReadyTimeout)
 			defer cancel()
 
+			// 重试检查两次，Prometheus的配置中必须要有external_labels
+			// 可以标记一下数据来源于哪个region，哪个replica
 			if err := runutil.Retry(2*time.Second, extLabelsCtx.Done(), func() error {
 				if len(m.Labels()) == 0 {
 					return errors.New("not uploading as no external labels are configured yet - is Prometheus healthy/reachable?")
@@ -290,6 +319,7 @@ func runSidecar(
 				return errors.Wrapf(err, "aborting as no external labels found after waiting %s", promReadyTimeout)
 			}
 
+			// 数据上传的是由Shipper负责的，中文翻译是发货人
 			var s *shipper.Shipper
 			if uploadCompacted {
 				s = shipper.NewWithCompacted(logger, reg, dataDir, bkt, m.Labels, metadata.SidecarSource)
@@ -297,6 +327,7 @@ func runSidecar(
 				s = shipper.New(logger, reg, dataDir, bkt, m.Labels, metadata.SidecarSource)
 			}
 
+			// 每30s进行一次文件夹数据同步
 			return runutil.Repeat(30*time.Second, ctx.Done(), func() error {
 				if uploaded, err := s.Sync(ctx); err != nil {
 					level.Warn(logger).Log("err", err, "uploaded", uploaded)
@@ -307,6 +338,7 @@ func runSidecar(
 					level.Warn(logger).Log("msg", "reading timestamps failed", "err", err)
 					return nil
 				}
+				// 更新一下时间
 				m.UpdateTimestamps(minTime, math.MaxInt64)
 				return nil
 			})
@@ -319,6 +351,7 @@ func runSidecar(
 	return nil
 }
 
+// 校验maxTime和minTime,其实这可以把prometheus的数据目录也拉处理，少一次配置和维护
 func validatePrometheus(ctx context.Context, logger log.Logger, m *promMetadata) error {
 	var (
 		flagErr error
@@ -360,7 +393,7 @@ type promMetadata struct {
 	mtx    sync.Mutex
 	mint   int64
 	maxt   int64
-	labels labels.Labels
+	labels labels.Labels // 从Prometheus中拉到的一些tag
 
 	limitMinTime thanosmodel.TimeOrDurationValue
 }
